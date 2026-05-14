@@ -5,3 +5,6 @@ cover/
 dist/
 nosetests.xml
 build
+.idea/
+.venv/
+
