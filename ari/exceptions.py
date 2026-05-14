@@ -1,19 +1,28 @@
-import json
+from __future__ import annotations
 
-from requests import RequestException
+from typing import TYPE_CHECKING, cast
+
+import httpx
+
+if TYPE_CHECKING:
+    from ari.client import ARIClient
+
+_HTTP_ERRORS: dict[int, type[ARIHTTPError]]
 
 
-class ARIException(RequestException):
-    def __init__(self, ari_client, original_error):
-        self.client = ari_client
-        self.original_error = original_error
-        self.original_message = self._extract_original_error_message(original_error)
+class ARIException(Exception):
+    def __init__(self, client: ARIClient | None, response: httpx.Response) -> None:
+        self.client = client
+        self.response = response
+        self.message = self._extract_message(response)
+        super().__init__(self.message or str(response.status_code))
 
-    def _extract_original_error_message(self, original_error):
+    @staticmethod
+    def _extract_message(response: httpx.Response) -> str | None:
         try:
-            return original_error.response.json().get('message')
-        except (TypeError, AttributeError, json.JSONDecodeError):
-            return
+            return cast(str | None, response.json().get("message"))
+        except Exception:
+            return None
 
 
 class ARIHTTPError(ARIException):
@@ -38,3 +47,18 @@ class ARIServerError(ARIHTTPError):
 
 class ARIServerUnavailable(ARIHTTPError):
     pass
+
+
+_HTTP_ERRORS = {
+    404: ARINotFound,
+    409: ARINotInStasis,
+    422: ARIUnprocessable,
+    500: ARIServerError,
+    503: ARIServerUnavailable,
+}
+
+
+def raise_for_status(response: httpx.Response, client: ARIClient | None) -> None:
+    if response.is_error:
+        exc_class = _HTTP_ERRORS.get(response.status_code, ARIException)
+        raise exc_class(client, response)

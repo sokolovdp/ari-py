@@ -46,6 +46,7 @@ def _enrich_exceptions(function, client):
             raise exception_class(client, e)
         except requests.RequestException as e:
             raise exceptions.ARIException(client, e)
+
     return decorator
 
 
@@ -78,13 +79,15 @@ class Repository(object):
         :param item: Item name.
         """
         oper = getattr(self.api, item, None)
-        if not (hasattr(oper, '__call__') and hasattr(oper, 'json')):
-            raise AttributeError(
-                "'%r' object has no attribute '%s'" % (self, item))
+        if not (hasattr(oper, "__call__") and hasattr(oper, "json")):
+            raise AttributeError("'%r' object has no attribute '%s'" % (self, item))
 
         # The returned function wraps the underlying operation, promoting the
         # received HTTP response to a first class object.
-        return _enrich_exceptions(lambda **kwargs: promote(self.client, oper(**kwargs), oper.json), self.client)
+        return _enrich_exceptions(
+            lambda **kwargs: promote(self.client, oper(**kwargs), oper.json),
+            self.client,
+        )
 
 
 class ObjectIdGenerator(object):
@@ -121,7 +124,7 @@ class DefaultObjectIdGenerator(ObjectIdGenerator):
     :param id_field:    Name of the field to specify in JSON.
     """
 
-    def __init__(self, param_name, id_field='id'):
+    def __init__(self, param_name, id_field="id"):
         self.param_name = param_name
         self.id_field = id_field
 
@@ -163,9 +166,8 @@ class BaseObject(object):
         :param item:
         """
         oper = getattr(self.api, item, None)
-        if not (hasattr(oper, '__call__') and hasattr(oper, 'json')):
-            raise AttributeError(
-                "'%r' object has no attribute '%r'" % (self, item))
+        if not (hasattr(oper, "__call__") and hasattr(oper, "json")):
+            raise AttributeError("'%r' object has no attribute '%r'" % (self, item))
 
         def enrich_operation(**kwargs):
             """Enriches an operation by specifying parameters specifying this
@@ -220,12 +222,12 @@ class Channel(BaseObject):
     :param channel_json: Instance data
     """
 
-    id_generator = DefaultObjectIdGenerator('channelId')
+    id_generator = DefaultObjectIdGenerator("channelId")
 
     def __init__(self, client, channel_json):
         super(Channel, self).__init__(
-            client, client.swagger.channels, channel_json,
-            client.on_channel_event)
+            client, client.swagger.channels, channel_json, client.on_channel_event
+        )
 
 
 class Bridge(BaseObject):
@@ -236,12 +238,12 @@ class Bridge(BaseObject):
     :param bridge_json: Instance data
     """
 
-    id_generator = DefaultObjectIdGenerator('bridgeId')
+    id_generator = DefaultObjectIdGenerator("bridgeId")
 
     def __init__(self, client, bridge_json):
         super(Bridge, self).__init__(
-            client, client.swagger.bridges, bridge_json,
-            client.on_bridge_event)
+            client, client.swagger.bridges, bridge_json, client.on_bridge_event
+        )
 
 
 class Playback(BaseObject):
@@ -251,12 +253,13 @@ class Playback(BaseObject):
     :type  client:  client.Client
     :param playback_json: Instance data
     """
-    id_generator = DefaultObjectIdGenerator('playbackId')
+
+    id_generator = DefaultObjectIdGenerator("playbackId")
 
     def __init__(self, client, playback_json):
         super(Playback, self).__init__(
-            client, client.swagger.playbacks, playback_json,
-            client.on_playback_event)
+            client, client.swagger.playbacks, playback_json, client.on_playback_event
+        )
 
 
 class LiveRecording(BaseObject):
@@ -266,12 +269,16 @@ class LiveRecording(BaseObject):
     :type  client: client.Client
     :param recording_json: Instance data
     """
-    id_generator = DefaultObjectIdGenerator('recordingName', id_field='name')
+
+    id_generator = DefaultObjectIdGenerator("recordingName", id_field="name")
 
     def __init__(self, client, recording_json):
         super(LiveRecording, self).__init__(
-            client, client.swagger.recordings, recording_json,
-            client.on_live_recording_event)
+            client,
+            client.swagger.recordings,
+            recording_json,
+            client.on_live_recording_event,
+        )
 
 
 class StoredRecording(BaseObject):
@@ -281,24 +288,24 @@ class StoredRecording(BaseObject):
     :type  client: client.Client
     :param recording_json: Instance data
     """
-    id_generator = DefaultObjectIdGenerator('recordingName', id_field='name')
+
+    id_generator = DefaultObjectIdGenerator("recordingName", id_field="name")
 
     def __init__(self, client, recording_json):
         super(StoredRecording, self).__init__(
-            client, client.swagger.recordings, recording_json,
-            client.on_stored_recording_event)
+            client,
+            client.swagger.recordings,
+            recording_json,
+            client.on_stored_recording_event,
+        )
 
 
 # noinspection PyDocstring
 class EndpointIdGenerator(ObjectIdGenerator):
-    """Id generator for endpoints, because they are weird.
-    """
+    """Id generator for endpoints, because they are weird."""
 
     def get_params(self, obj_json):
-        return {
-            'tech': obj_json['technology'],
-            'resource': obj_json['resource']
-        }
+        return {"tech": obj_json["technology"], "resource": obj_json["resource"]}
 
     def id_as_str(self, obj_json):
         return "%(tech)s/%(resource)s" % self.get_params(obj_json)
@@ -311,12 +318,13 @@ class Endpoint(BaseObject):
     :type  client:  client.Client
     :param endpoint_json: Instance data
     """
+
     id_generator = EndpointIdGenerator()
 
     def __init__(self, client, endpoint_json):
         super(Endpoint, self).__init__(
-            client, client.swagger.endpoints, endpoint_json,
-            client.on_endpoint_event)
+            client, client.swagger.endpoints, endpoint_json, client.on_endpoint_event
+        )
 
 
 class DeviceState(BaseObject):
@@ -326,12 +334,16 @@ class DeviceState(BaseObject):
     :type  client:  client.Client
     :param endpoint_json: Instance data
     """
-    id_generator = DefaultObjectIdGenerator('deviceName', id_field='name')
+
+    id_generator = DefaultObjectIdGenerator("deviceName", id_field="name")
 
     def __init__(self, client, device_state_json):
         super(DeviceState, self).__init__(
-            client, client.swagger.deviceStates, device_state_json,
-            client.on_device_state_event)
+            client,
+            client.swagger.deviceStates,
+            device_state_json,
+            client.on_device_state_event,
+        )
 
 
 class Sound(BaseObject):
@@ -342,11 +354,12 @@ class Sound(BaseObject):
     :param sound_json: Instance data
     """
 
-    id_generator = DefaultObjectIdGenerator('soundId')
+    id_generator = DefaultObjectIdGenerator("soundId")
 
     def __init__(self, client, sound_json):
         super(Sound, self).__init__(
-            client, client.swagger.sounds, sound_json, client.on_sound_event)
+            client, client.swagger.sounds, sound_json, client.on_sound_event
+        )
 
 
 class Mailbox(BaseObject):
@@ -357,11 +370,12 @@ class Mailbox(BaseObject):
     :param mailbox_json: Instance data
     """
 
-    id_generator = DefaultObjectIdGenerator('mailboxName', id_field='name')
+    id_generator = DefaultObjectIdGenerator("mailboxName", id_field="name")
 
     def __init__(self, client, mailbox_json):
         super(Mailbox, self).__init__(
-            client, client.swagger.mailboxes, mailbox_json, None)
+            client, client.swagger.mailboxes, mailbox_json, None
+        )
 
 
 def promote(client, resp, operation_json):
@@ -378,9 +392,9 @@ def promote(client, resp, operation_json):
     """
     resp.raise_for_status()
 
-    response_class = operation_json['responseClass']
+    response_class = operation_json["responseClass"]
     is_list = False
-    m = re.match('''List\[(.*)\]''', response_class)
+    m = re.match("""List\[(.*)\]""", response_class)
     if m:
         response_class = m.group(1)
         is_list = True
@@ -397,12 +411,12 @@ def promote(client, resp, operation_json):
 
 
 CLASS_MAP = {
-    'Bridge': Bridge,
-    'Channel': Channel,
-    'Endpoint': Endpoint,
-    'Playback': Playback,
-    'LiveRecording': LiveRecording,
-    'StoredRecording': StoredRecording,
-    'Mailbox': Mailbox,
-    'DeviceState': DeviceState,
+    "Bridge": Bridge,
+    "Channel": Channel,
+    "Endpoint": Endpoint,
+    "Playback": Playback,
+    "LiveRecording": LiveRecording,
+    "StoredRecording": StoredRecording,
+    "Mailbox": Mailbox,
+    "DeviceState": DeviceState,
 }

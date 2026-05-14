@@ -1,354 +1,330 @@
-# Copyright 2013-2022 The Wazo Authors  (see the AUTHORS file)
-# SPDX-License-Identifier: GPL-3.0-or-later
+from __future__ import annotations
 
-"""ARI client library.
-"""
-
+import asyncio
 import json
 import logging
-import six.moves.urllib as urllib
-import swaggerpy.client
-
 from collections import defaultdict
+from typing import Any, Callable
 
-from ari.model import *
+import httpx
+import websockets
+
+from ari.events import EventUnsubscriber
+from ari.models import (
+    Bridge,
+    Channel,
+    DeviceState,
+    Endpoint,
+    LiveRecording,
+    Playback,
+    Sound,
+    StoredRecording,
+)
+from ari.repositories import (
+    ApplicationRepository,
+    AsteriskRepository,
+    BridgeRepository,
+    ChannelRepository,
+    DeviceStateRepository,
+    EndpointRepository,
+    MailboxRepository,
+    PlaybackRepository,
+    RecordingRepository,
+    SoundRepository,
+)
 
 log = logging.getLogger(__name__)
 
+_EVENT_MODEL_MAP: dict[str, dict[str, str]] = {
+    "PlaybackStarted": {"playback": "Playback"},
+    "PlaybackFinished": {"playback": "Playback"},
+    "RecordingStarted": {"recording": "LiveRecording"},
+    "RecordingFinished": {"recording": "LiveRecording"},
+    "RecordingFailed": {"recording": "LiveRecording"},
+    "BridgeCreated": {"bridge": "Bridge"},
+    "BridgeDestroyed": {"bridge": "Bridge"},
+    "BridgeMerged": {"bridge": "Bridge", "bridge_from": "Bridge"},
+    "ChannelCreated": {"channel": "Channel"},
+    "ChannelDestroyed": {"channel": "Channel"},
+    "ChannelEnteredBridge": {"bridge": "Bridge", "channel": "Channel"},
+    "ChannelLeftBridge": {"bridge": "Bridge", "channel": "Channel"},
+    "ChannelStateChange": {"channel": "Channel"},
+    "ChannelDtmfReceived": {"channel": "Channel"},
+    "ChannelDialplan": {"channel": "Channel"},
+    "ChannelCallerId": {"channel": "Channel"},
+    "ChannelUserevent": {"channel": "Channel"},
+    "ChannelHangupRequest": {"channel": "Channel"},
+    "ChannelVarset": {"channel": "Channel"},
+    "EndpointStateChange": {"endpoint": "Endpoint"},
+    "StasisEnd": {"channel": "Channel"},
+    "StasisStart": {"channel": "Channel"},
+}
 
-class Client(object):
-    """ARI Client object.
+_MODEL_CLASS_MAP: dict[str, type[Any]] = {
+    "Channel": Channel,
+    "Bridge": Bridge,
+    "Playback": Playback,
+    "LiveRecording": LiveRecording,
+    "StoredRecording": StoredRecording,
+    "Endpoint": Endpoint,
+    "DeviceState": DeviceState,
+    "Sound": Sound,
+}
 
-    :param base_url: Base URL for accessing Asterisk.
-    :param http_client: HTTP client interface.
-    """
 
-    def __init__(self, base_url, http_client):
-        self.base_url = base_url
-        url = urllib.parse.urljoin(base_url, "ari/api-docs/resources.json")
+class ARIClient:
+    def __init__(self, base_url: str, username: str, password: str) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._username = username
+        self._password = password
+        self._http = httpx.AsyncClient(
+            base_url=f"{self._base_url}/ari",
+            auth=(username, password),
+            headers={"Content-Type": "application/json"},
+        )
+        self.channels = ChannelRepository(self._http, self)
+        self.bridges = BridgeRepository(self._http, self)
+        self.playbacks = PlaybackRepository(self._http, self)
+        self.recordings = RecordingRepository(self._http, self)
+        self.endpoints = EndpointRepository(self._http, self)
+        self.device_states = DeviceStateRepository(self._http, self)
+        self.sounds = SoundRepository(self._http, self)
+        self.mailboxes = MailboxRepository(self._http, self)
+        self.applications = ApplicationRepository(self._http, self)
+        self.asterisk = AsteriskRepository(self._http, self)
 
-        self.swagger = swaggerpy.client.SwaggerClient(
-            url, http_client=http_client)
-        self.repositories = {
-            name: Repository(self, name, api)
-            for (name, api) in self.swagger.resources.items()}
+        self._listeners: dict[str, list[tuple[Any, ...]]] = {}
+        self._app_registered_callbacks: defaultdict[str, list[tuple[Any, ...]]] = (
+            defaultdict(list)
+        )
+        self._app_deregistered_callbacks: defaultdict[str, list[tuple[Any, ...]]] = (
+            defaultdict(list)
+        )
+        self.exception_handler: Callable[[Exception], None] = lambda ex: log.exception(
+            "Event listener threw exception"
+        )
+        self._ws: websockets.ClientConnection | None = None
 
-        # Extract models out of the events resource
-        events = [api['api_declaration']
-                  for api in self.swagger.api_docs['apis']
-                  if api['name'] == 'events']
-        if events:
-            self.event_models = events[0]['models']
-        else:
-            self.event_models = {}
+    async def close(self) -> None:
+        if self._ws is not None:
+            await self._ws.close()
+        await self._http.aclose()
 
-        self.websockets = set()
-        self.event_listeners = {}
-        self.exception_handler = \
-            lambda ex: log.exception("Event listener threw exception")
-        self._app_registered_callbacks = defaultdict(list)
-        self._app_deregistered_callbacks = defaultdict(list)
+    async def __aenter__(self) -> ARIClient:
+        return self
 
-    def __getattr__(self, item):
-        """Exposes repositories as fields of the client.
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()
 
-        :param item: Field name
-        """
-        repo = self.get_repo(item)
-        if not repo:
-            raise AttributeError(
-                "'%r' object has no attribute '%s'" % (self, item))
-        return repo
+    def on_event(
+        self,
+        event_type: str,
+        event_cb: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> EventUnsubscriber:
+        listeners = self._listeners.setdefault(event_type, [])
+        for cb in listeners:
+            if event_cb is cb[0]:
+                listeners.remove(cb)
+                break
+        callback_obj: tuple[Any, ...] = (event_cb, args, kwargs)
+        listeners.append(callback_obj)
+        return EventUnsubscriber(listeners, callback_obj)
 
-    def close(self):
-        """Close this ARI client.
-
-        This method will close any currently open WebSockets, and close the
-        underlying Swaggerclient.
-        """
-        for ws in self.websockets:
-            ws.send_close()
-        self.swagger.close()
-
-    def get_repo(self, name):
-        """Get a specific repo by name.
-
-        :param name: Name of the repo to get
-        :return: Repository, or None if not found.
-        :rtype:  ari.model.Repository
-        """
-        return self.repositories.get(name)
-
-    def __run(self, ws):
-        """Drains all messages from a WebSocket, sending them to the client's
-        listeners.
-
-        :param ws: WebSocket to drain.
-        """
-        # TypeChecker false positive on iter(callable, sentinel) -> iterator
-        # Fixed in plugin v3.0.1
-        # noinspection PyTypeChecker
-        for msg_str in iter(lambda: ws.recv(), None):
-            if not msg_str:
-                log.debug("Invalid empty event")
-                continue
-
-            msg_json = json.loads(msg_str)
-            self.on_stasis_event(msg_json)
-
-    def on_stasis_event(self, event):
-        if not isinstance(event, dict):
-            log.error('Invalid event not a dict: %s', event)
+    async def _dispatch(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if not event_type:
+            log.error("Event missing 'type': %s", event)
             return
-
-        try:
-            listeners = list(self.event_listeners.get(event['type'], []))
-        except KeyError:
-            log.error('Invalid event no "type" key: %s', event)
-            return
-
-        for listener in listeners:
-            # noinspection PyBroadException
+        for callback, args, kwargs in list(self._listeners.get(event_type, [])):
             try:
-                callback, args, kwargs = listener
-                args = args or ()
-                kwargs = kwargs or {}
-                callback(event, *args, **kwargs)
+                result = callback(event, *args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as e:
                 self.exception_handler(e)
 
-    def run(self, apps):
-        """Connect to the WebSocket and begin processing messages.
+    def on_object_event(
+        self,
+        event_type: str,
+        event_cb: Callable[..., Any],
+        factory_fn: Callable[..., Any],
+        model_id: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> EventUnsubscriber:
+        event_model = _EVENT_MODEL_MAP.get(event_type)
+        if not event_model:
+            raise ValueError(f"Cannot find event model '{event_type}'")
+        obj_fields = [k for k, v in event_model.items() if v == model_id]
+        if not obj_fields:
+            raise ValueError(
+                f"Event model '{event_type}' has no fields of type {model_id}"
+            )
 
-        This method will block until all messages have been received from the
-        WebSocket, or until this client has been closed.
+        def extract_objects(event: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+            obj: Any = {
+                field: factory_fn(self, event[field])
+                for field in obj_fields
+                if event.get(field)
+            }
+            if len(obj_fields) == 1:
+                obj = list(obj.values())[0] if obj else None
+            event_cb(obj, event, *args, **kwargs)
 
-        :param apps: Application (or list of applications) to connect for
-        :type  apps: str or list of str
-        """
-        if isinstance(apps, list):
-            apps = ','.join(apps)
-        ws = self.swagger.events.eventWebsocket(app=apps)
-        self.websockets.add(ws)
+        return self.on_event(event_type, extract_objects, *args, **kwargs)
 
-        self._execute_app_registered_callbacks(apps)
-        try:
-            self.__run(ws)
-        finally:
-            self._execute_app_deregistered_callbacks(apps)
-            ws.close()
-            self.websockets.remove(ws)
+    def on_channel_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: Channel._with_client(d, client),
+            "Channel",
+            *args,
+            **kwargs,
+        )
 
-    def _execute_app_deregistered_callbacks(self, apps):
-        self._execute_app_callbacks(apps, self._app_deregistered_callbacks)
+    def on_bridge_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: Bridge._with_client(d, client),
+            "Bridge",
+            *args,
+            **kwargs,
+        )
 
-    def _execute_app_registered_callbacks(self, apps):
+    def on_playback_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: Playback._with_client(d, client),
+            "Playback",
+            *args,
+            **kwargs,
+        )
+
+    def on_live_recording_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: LiveRecording._with_client(d, client),
+            "LiveRecording",
+            *args,
+            **kwargs,
+        )
+
+    def on_stored_recording_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: StoredRecording._with_client(d, client),
+            "StoredRecording",
+            *args,
+            **kwargs,
+        )
+
+    def on_endpoint_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: Endpoint._with_client(d, client),
+            "Endpoint",
+            *args,
+            **kwargs,
+        )
+
+    def on_device_state_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: DeviceState._with_client(d, client),
+            "DeviceState",
+            *args,
+            **kwargs,
+        )
+
+    def on_sound_event(
+        self, event_type: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> EventUnsubscriber:
+        return self.on_object_event(
+            event_type,
+            fn,
+            lambda client, d: Sound._with_client(d, client),
+            "Sound",
+            *args,
+            **kwargs,
+        )
+
+    def on_application_registered(
+        self,
+        application_name: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        self._app_registered_callbacks[application_name].append((fn, args, kwargs))
+
+    def on_application_deregistered(
+        self,
+        application_name: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        self._app_deregistered_callbacks[application_name].append((fn, args, kwargs))
+
+    def _execute_app_registered_callbacks(self, apps: str) -> None:
         self._execute_app_callbacks(apps, self._app_registered_callbacks)
 
-    def _execute_app_callbacks(self, apps, callback_map):
-        for app in apps.split(','):
+    def _execute_app_deregistered_callbacks(self, apps: str) -> None:
+        self._execute_app_callbacks(apps, self._app_deregistered_callbacks)
+
+    def _execute_app_callbacks(
+        self, apps: str, callback_map: dict[str, list[tuple[Any, ...]]]
+    ) -> None:
+        for app in apps.split(","):
             for fn, args, kwargs in callback_map[app]:
                 try:
                     fn(*args, **kwargs)
                 except Exception as e:
                     self.exception_handler(e)
 
-    def on_event(self, event_type, event_cb, *args, **kwargs):
-        """Register callback for events with given type.
-
-        :param event_type: String name of the event to register for.
-        :param event_cb: Callback function
-        :type  event_cb: (dict) -> None
-        :param args: Arguments to pass to event_cb
-        :param kwargs: Keyword arguments to pass to event_cb
-        """
-        listeners = self.event_listeners.setdefault(event_type, list())
-        for cb in listeners:
-            if event_cb == cb[0]:
-                listeners.remove(cb)
-        callback_obj = (event_cb, args, kwargs)
-        listeners.append(callback_obj)
-        client = self
-
-        class EventUnsubscriber(object):
-            """Class to allow events to be unsubscribed.
-            """
-
-            def close(self):
-                """Unsubscribe the associated event callback.
-                """
-                if callback_obj in client.event_listeners[event_type]:
-                    client.event_listeners[event_type].remove(callback_obj)
-
-        return EventUnsubscriber()
-
-    def on_object_event(self, event_type, event_cb, factory_fn, model_id,
-                        *args, **kwargs):
-        """Register callback for events with the given type. Event fields of
-        the given model_id type are passed along to event_cb.
-
-        If multiple fields of the event have the type model_id, a dict is
-        passed mapping the field name to the model object.
-
-        :param event_type: String name of the event to register for.
-        :param event_cb: Callback function
-        :type  event_cb: (Obj, dict) -> None or (dict[str, Obj], dict) ->
-        :param factory_fn: Function for creating Obj from JSON
-        :param model_id: String id for Obj from Swagger models.
-        :param args: Arguments to pass to event_cb
-        :param kwargs: Keyword arguments to pass to event_cb
-        """
-        # Find the associated model from the Swagger declaration
-        event_model = self.event_models.get(event_type)
-        if not event_model:
-            raise ValueError("Cannot find event model '%s'" % event_type)
-
-        # Extract the fields that are of the expected type
-        obj_fields = [k for (k, v) in event_model['properties'].items()
-                      if v['type'] == model_id]
-        if not obj_fields:
-            raise ValueError("Event model '%s' has no fields of type %s"
-                             % (event_type, model_id))
-
-        def extract_objects(event, *args, **kwargs):
-            """Extract objects of a given type from an event.
-
-            :param event: Event
-            :param args: Arguments to pass to the event callback
-            :param kwargs: Keyword arguments to pass to the event
-                                      callback
-            """
-            # Extract the fields which are of the expected type
-            obj = {obj_field: factory_fn(self, event[obj_field])
-                   for obj_field in obj_fields
-                   if event.get(obj_field)}
-            # If there's only one field in the schema, just pass that along
-            if len(obj_fields) == 1:
-                if obj:
-                    obj = list(obj.values())[0]
-                else:
-                    obj = None
-            event_cb(obj, event, *args, **kwargs)
-
-        return self.on_event(event_type, extract_objects,
-                             *args,
-                             **kwargs)
-
-    def on_application_registered(self, application_name, fn, *args, **kwargs):
-        """Register callback for application registered events
-
-        :param application_name: String name of the stasis application
-        :param fn: Callback function
-        :type  fn: (*args, **kwargs) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        self._app_registered_callbacks[application_name].append((fn, args, kwargs))
-
-    def on_application_deregistered(self, application_name, fn, *args, **kwargs):
-        """Register callback for application deregistered events
-
-        :param application_name: String name of the stasis application
-        :param fn: Callback function
-        :type  fn: (*args, **kwargs) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        self._app_deregistered_callbacks[application_name].append((fn, args, kwargs))
-
-    def on_channel_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for Channel related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (Channel, dict) -> None or (list[Channel], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, Channel, 'Channel',
-                                    *args, **kwargs)
-
-    def on_bridge_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for Bridge related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (Bridge, dict) -> None or (list[Bridge], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, Bridge, 'Bridge',
-                                    *args, **kwargs)
-
-    def on_playback_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for Playback related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (Playback, dict) -> None or (list[Playback], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, Playback, 'Playback',
-                                    *args, **kwargs)
-
-    def on_live_recording_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for LiveRecording related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (LiveRecording, dict) -> None or (list[LiveRecording], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, LiveRecording,
-                                    'LiveRecording', *args, **kwargs)
-
-    def on_stored_recording_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for StoredRecording related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (StoredRecording, dict) -> None or (list[StoredRecording], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, StoredRecording,
-                                    'StoredRecording', *args, **kwargs)
-
-    def on_endpoint_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for Endpoint related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (Endpoint, dict) -> None or (list[Endpoint], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, Endpoint, 'Endpoint',
-                                    *args, **kwargs)
-
-    def on_device_state_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for DeviceState related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Callback function
-        :type  fn: (DeviceState, dict) -> None or (list[DeviceState], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, DeviceState, 'DeviceState',
-                                    *args, **kwargs)
-
-    def on_sound_event(self, event_type, fn, *args, **kwargs):
-        """Register callback for Sound related events
-
-        :param event_type: String name of the event to register for.
-        :param fn: Sound function
-        :type  fn: (Sound, dict) -> None or (list[Sound], dict) -> None
-        :param args: Arguments to pass to fn
-        :param kwargs: Keyword arguments to pass to fn
-        """
-        return self.on_object_event(event_type, fn, Sound, 'Sound',
-                                    *args, **kwargs)
-
+    async def run(self, apps: str | list[str]) -> None:
+        if isinstance(apps, list):
+            apps = ",".join(apps)
+        url = (
+            f"{self._base_url}/ari/events"
+            f"?app={apps}&api_key={self._username}:{self._password}"
+        )
+        async with websockets.connect(url) as ws:
+            self._ws = ws
+            self._execute_app_registered_callbacks(apps)
+            try:
+                async for raw in ws:
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        log.error("Failed to parse event JSON: %s", raw)
+                        continue
+                    await self._dispatch(event)
+            finally:
+                self._execute_app_deregistered_callbacks(apps)
+                self._ws = None

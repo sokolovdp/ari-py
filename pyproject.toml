@@ -1,0 +1,31 @@
+[project]
+name = "ari-py"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28",
+    "websockets>=14",
+    "pydantic>=2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "respx>=0.21",
+    "mypy>=1.15",
+    "ruff>=0.11",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["ari_test"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+exclude = ["ari/model.py"]
+
+[tool.setuptools.packages.find]
+include = ["ari", "ari_test"]
+exclude = ["sample-api*"]

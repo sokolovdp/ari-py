@@ -7,6 +7,9 @@ channels that enter Stasis is placed into the bridge. Whenever a channel
 enters the bridge, a tone is played to the bridge.
 """
 
+
+
+
 #
 # Copyright (c) 2013, Digium, Inc.
 #
@@ -16,17 +19,14 @@ import ari
 
 client = ari.connect('http://localhost:8088/', 'hey', 'peekaboo')
 
-#
-# Find (or create) a holding bridge.
-#
-bridges = [b for b in client.bridges.list() if
-           b.json['bridge_type'] == 'holding']
-if bridges:
+if bridges := [
+    b for b in client.bridges.list() if b.json['bridge_type'] == 'holding'
+]:
     bridge = bridges[0]
-    print("Using bridge %s" % bridge.id)
+    print(f"Using bridge {bridge.id}")
 else:
     bridge = client.bridges.create(type='holding')
-    print("Created bridge %s" % bridge.id)
+    print(f"Created bridge {bridge.id}")
 
 
 def on_enter(bridge, ev):

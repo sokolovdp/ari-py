@@ -1,26 +1,33 @@
-#
-# Copyright (c) 2013, Digium, Inc.
-#
+from ari.client import ARIClient
+from ari import exceptions
+from ari.models import (
+    Bridge,
+    Channel,
+    DeviceState,
+    Endpoint,
+    LiveRecording,
+    Mailbox,
+    Playback,
+    Sound,
+    StoredRecording,
+)
 
-"""ARI client library
-"""
 
-import ari.client
-import swaggerpy.http_client
-import six.moves.urllib as urllib
-
-Client = client.Client
+def connect(base_url: str, username: str, password: str) -> ARIClient:
+    return ARIClient(base_url, username, password)
 
 
-def connect(base_url, username, password):
-    """Helper method for easily connecting to ARI.
-
-    :param base_url: Base URL for Asterisk HTTP server (http://localhost:8088/)
-    :param username: ARI username
-    :param password: ARI password.
-    :return:
-    """
-    split = urllib.parse.urlsplit(base_url)
-    http_client = swaggerpy.http_client.SynchronousHttpClient()
-    http_client.set_basic_auth(split.hostname, username, password)
-    return Client(base_url, http_client)
+__all__ = [
+    "ARIClient",
+    "connect",
+    "exceptions",
+    "Bridge",
+    "Channel",
+    "DeviceState",
+    "Endpoint",
+    "LiveRecording",
+    "Mailbox",
+    "Playback",
+    "Sound",
+    "StoredRecording",
+]
