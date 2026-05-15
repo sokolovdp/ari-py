@@ -10,8 +10,12 @@
 import requests
 
 from __future__ import print_function
-import ari
 
+import ari
+#
+# Copyright (c) 2013, Digium, Inc.
+#
+import requests
 from requests import HTTPError
 
 OUTGOING_ENDPOINT = "SIP/blink"
@@ -32,9 +36,9 @@ else:
 
 
 def safe_hangup(channel):
-    """Hangup a channel, ignoring 404 errors.
-
-    :param channel: Channel to hangup.
+    """
+    Hangup a channel, ignoring 404 errors.
+    channel: Channel to hangup.
     """
     try:
         channel.hangup()
@@ -45,14 +49,15 @@ def safe_hangup(channel):
 
 
 def on_start(incoming, event):
-    """Callback for StasisStart events.
+    """
+    Callback for StasisStart events.
 
     When an incoming channel starts, put it in the holding bridge and
     originate a channel to connect to it. When that channel answers, create a
     bridge and put both of them into it.
 
-    :param incoming:
-    :param event:
+    - incoming: Channel that started
+    - event: StasisStart event
     """
     # Only process channels with the 'incoming' argument
     if event['args'] != ['incoming']:
@@ -65,7 +70,8 @@ def on_start(incoming, event):
 
     # Originate the outgoing channel
     outgoing = client.channels.originate(
-        endpoint=OUTGOING_ENDPOINT, app="hello", appArgs="dialed")
+        endpoint=OUTGOING_ENDPOINT, app="hello", appArgs="dialed",
+    )
 
     # If the incoming channel ends, hangup the outgoing channel
     incoming.on_event('StasisEnd', lambda *args: safe_hangup(outgoing))
